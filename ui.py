@@ -1,0 +1,218 @@
+import customtkinter
+import os
+import pygame
+import threading
+from mutagen.wave import WAVE
+from scrape import Scraper
+
+class App(customtkinter.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Music Scraper & Player")
+        self.geometry("1100x600")
+        
+        # Core Components
+        self.scrape = Scraper()
+        pygame.mixer.init()
+        self.music_dir = "./music"
+        
+        # State Variables
+        self.current_folder = ""
+        self.song_list = []
+        self.song_buttons = {}
+        self.is_playing = False
+        self.current_song_path = ""
+        self.current_offset = 0.0
+        self.duration = 0.0
+        
+        # Playlist Logic
+        self.current_idx = 0
+        # 0: No Repeat, 1: Repeat Once, 2: Repeat Endlessly
+        self.repeat_state = 0 
+
+        self.show_home_page()
+
+    def clear_screen(self):
+        for child in self.winfo_children():
+            child.destroy()
+
+    # --- NAVIGATION ---
+    def show_home_page(self):
+        self.clear_screen()
+        label = customtkinter.CTkLabel(self, text="Music Collections", font=("Arial", 24, "bold"))
+        label.pack(pady=20)
+        container = customtkinter.CTkScrollableFrame(self, width=500, height=300)
+        container.pack(pady=10, padx=20)
+        if os.path.exists(self.music_dir):
+            folders = [f for f in os.listdir(self.music_dir) if os.path.isdir(os.path.join(self.music_dir, f))]
+            for folder in folders:
+                btn = customtkinter.CTkButton(container, text=folder, command=lambda f=folder: self.load_player(f))
+                btn.pack(pady=5, fill="x")
+        new_btn = customtkinter.CTkButton(self, text="+ New Collection", fg_color="#2ecc71", command=self.show_new_folder_entry)
+        new_btn.pack(pady=20)
+
+    def show_new_folder_entry(self):
+        self.clear_screen()
+        customtkinter.CTkLabel(self, text="Folder Name:", font=("Arial", 18)).pack(pady=20)
+        entry = customtkinter.CTkEntry(self, width=300)
+        entry.pack(pady=10)
+        def proceed():
+            name = entry.get().strip()
+            if name:
+                self.current_folder = name
+                self.show_download_page()
+        customtkinter.CTkButton(self, text="Create & Add Links", command=proceed).pack(pady=10)
+        customtkinter.CTkButton(self, text="Back", fg_color="transparent", command=self.show_home_page).pack()
+
+    def show_download_page(self):
+        self.clear_screen()
+        self.grid_columnconfigure(0, weight=1); self.grid_columnconfigure(1, weight=4)
+        self.dl_sidebar = customtkinter.CTkScrollableFrame(self); self.dl_sidebar.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        input_area = customtkinter.CTkFrame(self); input_area.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
+        url_entry = customtkinter.CTkEntry(input_area, placeholder_text="YouTube URL", width=400); url_entry.pack(pady=10)
+        status_label = customtkinter.CTkLabel(input_area, text=""); status_label.pack()
+        def start_download():
+            url = url_entry.get()
+            if not url: return
+            status_label.configure(text="Downloading..."); threading.Thread(target=lambda: self.run_dl(url, status_label)).start()
+        customtkinter.CTkButton(input_area, text="Download", command=start_download).pack(pady=5)
+        customtkinter.CTkButton(input_area, text="Open Player", fg_color="green", command=lambda: self.load_player(self.current_folder)).pack(pady=20)
+
+    def run_dl(self, url, label):
+        if self.scrape.get(url, self.current_folder):
+            self.after(0, lambda: label.configure(text="Success!", text_color="green"))
+        else:
+            self.after(0, lambda: label.configure(text="Failed!", text_color="red"))
+
+    # --- PLAYER LOGIC ---
+    def load_player(self, folder):
+        self.current_folder = folder
+        path = os.path.join(self.music_dir, folder)
+        if not os.path.exists(path): os.makedirs(path)
+        self.song_list = sorted([f for f in os.listdir(path) if f.endswith(".wav")])
+        self.show_player_page()
+
+    def show_player_page(self):
+        self.clear_screen()
+        self.grid_columnconfigure(0, weight=2) 
+        self.grid_columnconfigure(1, weight=8) 
+        self.grid_rowconfigure(0, weight=1)
+
+        sidebar = customtkinter.CTkScrollableFrame(self)
+        sidebar.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        
+        player_frame = customtkinter.CTkFrame(self)
+        player_frame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
+
+        self.current_song_label = customtkinter.CTkLabel(player_frame, text="Select a Song", font=("Arial", 18))
+        self.current_song_label.pack(pady=40)
+
+        def update_slider():
+            if pygame.mixer.music.get_busy() and self.is_playing:
+                actual_pos = self.current_offset + (pygame.mixer.music.get_pos() / 1000.0)
+                self.audio_slider.set(actual_pos)
+                self.after(100, update_slider)
+
+        def check_music_end():
+            """Monitors if song finished to trigger next or repeat."""
+            if not pygame.mixer.music.get_busy() and self.is_playing:
+                if self.repeat_state == 2: # Endless
+                    play_song(self.current_idx)
+                elif self.repeat_state == 1: # Repeat Once
+                    self.update_repeat_ui(0) # Revert to No Repeat
+                    play_song(self.current_idx)
+                else: # No Repeat / Normal Progression
+                    next_idx = (self.current_idx + 1) % len(self.song_list)
+                    play_song(next_idx)
+            
+            # Continue loop only if the slider still exists (meaning we're on player page)
+            if hasattr(self, 'audio_slider') and self.audio_slider.winfo_exists():
+                self.after(1000, check_music_end)
+
+        def seek_audio(value):
+            if not self.current_song_path: return
+            self.current_offset = float(value)
+            pygame.mixer.music.play(start=self.current_offset)
+            self.is_playing = True
+            self.play_btn.configure(text="Pause", fg_color="orange")
+            update_slider()
+
+        def play_song(idx):
+            if not self.song_list: return
+            self.current_idx = idx
+            song_name = self.song_list[idx]
+            self.current_song_path = os.path.join(self.music_dir, self.current_folder, song_name)
+            
+            try:
+                audio = WAVE(self.current_song_path)
+                self.duration = audio.info.length
+                self.audio_slider.configure(to=self.duration)
+                self.audio_slider.set(0)
+                self.current_offset = 0.0
+                
+                pygame.mixer.music.load(self.current_song_path)
+                pygame.mixer.music.play()
+                self.is_playing = True
+                
+                self.current_song_label.configure(text=f"Playing: {song_name}")
+                self.play_btn.configure(text="Pause", fg_color="orange")
+                
+                for i, (name, btn) in enumerate(self.song_buttons.items()):
+                    btn.configure(fg_color="grey" if i == idx else "#2ecc71")
+                update_slider()
+            except Exception as e:
+                print(f"Playback error: {e}")
+
+        # Sidebar Buttons
+        self.song_buttons = {}
+        for i, song in enumerate(self.song_list):
+            btn = customtkinter.CTkButton(sidebar, text=song, fg_color="#2ecc71", 
+                                         command=lambda idx=i: play_song(idx))
+            btn.pack(pady=2, fill="x")
+            self.song_buttons[song] = btn
+
+        self.audio_slider = customtkinter.CTkSlider(player_frame, from_=0, to=100, command=seek_audio)
+        self.audio_slider.set(0)
+        self.audio_slider.pack(fill="x", padx=50, pady=20)
+
+        # Control Panel
+        ctrl_frame = customtkinter.CTkFrame(player_frame, fg_color="transparent")
+        ctrl_frame.pack(pady=20)
+
+        def toggle_play():
+            if not self.current_song_path: return
+            if self.is_playing:
+                pygame.mixer.music.pause(); self.is_playing = False
+                self.play_btn.configure(text="Play", fg_color="green")
+            else:
+                pygame.mixer.music.unpause(); self.is_playing = True
+                self.play_btn.configure(text="Pause", fg_color="orange")
+                update_slider()
+
+        self.play_btn = customtkinter.CTkButton(ctrl_frame, text="Play", command=toggle_play, fg_color="green")
+        self.play_btn.pack(side="left", padx=10)
+        
+        self.repeat_btn = customtkinter.CTkButton(ctrl_frame, text="No Repeat", command=self.cycle_repeat, fg_color="#3b3b3b")
+        self.repeat_btn.pack(side="left", padx=10)
+
+        customtkinter.CTkButton(player_frame, text="Home", command=self.show_home_page).pack(side="bottom", pady=20)
+
+        # Initialization
+        if self.song_list:
+            play_song(0)
+            check_music_end()
+
+    def update_repeat_ui(self, state):
+        self.repeat_state = state
+        states = ["No Repeat", "Repeat Once", "Repeat Endlessly"]
+        colors = ["#3b3b3b", "#3498db", "#9b59b6"]
+        self.repeat_btn.configure(text=states[self.repeat_state], fg_color=colors[self.repeat_state])
+
+    def cycle_repeat(self):
+        new_state = (self.repeat_state + 1) % 3
+        self.update_repeat_ui(new_state)
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
